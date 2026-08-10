@@ -350,6 +350,25 @@ def test_stop_sits_exactly_on_the_origin(engine, structure) -> None:
     assert setup.risk_distance == pytest.approx(EXPECTED_RISK)
 
 
+def test_describe_renders(engine, structure) -> None:
+    """`describe()` is only called on the path that actually places an order,
+    so nothing else in the suite exercises it.
+
+    That gap cost a live run: after Impulse changed from holding Swing objects
+    to holding prices, describe() still read `impulse.origin.price`. Every test
+    passed, the daemon ran fine while standing aside, and it crashed on the
+    first setup it found — five times, into the kill switch. A formatter that
+    only runs when money moves has to be tested like one.
+    """
+    setup = engine.signal_at(structure, as_of_index=22, reference_price=4070.0)
+    assert setup is not None
+    text = setup.describe()
+    for fragment in ("bullish", "entry=", "sl=", "tp=", "rr=1:", "range=", "origin", "peak"):
+        assert fragment in text, f"{fragment!r} missing from {text!r}"
+    assert f"{ORIGIN_PRICE:.3f}" in text
+    assert f"{PEAK_PRICE:.3f}" in text
+
+
 def test_target_is_at_least_one_to_two(engine, structure) -> None:
     setup = engine.signal_at(structure, as_of_index=22, reference_price=4070.0)
     assert setup is not None

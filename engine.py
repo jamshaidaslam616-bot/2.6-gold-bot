@@ -211,7 +211,7 @@ class Setup:
             f"{self.direction.value} entry={self.entry:.3f} sl={self.stop_loss:.3f} "
             f"tp={self.take_profit:.3f} rr=1:{self.risk_reward:.2f} "
             f"range={self.impulse.range:.3f} "
-            f"(origin {self.impulse.origin.price:.3f} -> peak {self.impulse.peak.price:.3f})"
+            f"(origin {self.impulse.origin_price:.3f} -> peak {self.impulse.peak_price:.3f})"
         )
 
 
