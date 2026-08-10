@@ -221,7 +221,14 @@ class RiskConfig:
     # through. So the live limit is this percentile of the instrument's own
     # recent spread distribution, and `max_spread_points` is only a backstop
     # against nonsense.
-    max_spread_percentile: float = 95.0
+    # A percentile alone is not enough. On a Zero account the spread is almost
+    # a constant 50 points, so p95 lands *on* the normal value and every tick
+    # gets refused — the bot sits idle forever while logging "spread 50 exceeds
+    # 50". Observed live on 2026-08-10. The median multiple gives the filter
+    # room to breathe on instruments whose spread barely varies; whichever is
+    # more generous wins, and the absolute ceiling still catches nonsense.
+    max_spread_percentile: float = 99.0
+    max_spread_median_multiple: float = 2.0
     max_spread_points: float = 600.0
 
     # Refuse to trade if the terminal's clock has drifted from ours. A skewed

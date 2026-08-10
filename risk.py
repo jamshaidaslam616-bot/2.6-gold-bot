@@ -308,7 +308,10 @@ class RiskManager:
             else self.cfg.max_spread_points,
             self.cfg.max_spread_points,
         )
-        if spread_points > limit:
+        # Rounded on both sides. Brokers quote spread in whole points, but the
+        # live figure is derived as (ask - bid) / point, which lands on
+        # 50.000000000000014 — enough to "exceed" a limit of exactly 50.
+        if round(spread_points) > round(limit):
             return RiskDecision(
                 False, f"spread {spread_points:.0f} points exceeds {limit:.0f}"
             )

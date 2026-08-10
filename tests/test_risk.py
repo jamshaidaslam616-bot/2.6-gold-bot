@@ -138,6 +138,22 @@ def test_wide_spread_is_refused_against_the_instrument_limit(manager: RiskManage
     assert ok.allowed, "a mini account's normal 200-point spread must be tradeable"
 
 
+def test_spread_exactly_at_the_limit_is_allowed(manager: RiskManager) -> None:
+    """The bug that left the daemon idle for its whole first run.
+
+    Brokers quote spread in whole points, but the live figure is derived as
+    (ask - bid) / point and lands on 50.000000000000014. Against a limit of
+    exactly 50 that "exceeds" it, so on a Zero account — where the spread is
+    almost a constant 50 — every single tick was refused.
+    """
+    assert manager.can_open(**{**HEALTHY, "spread_points": 50.000000000000014,
+                               "spread_limit_points": 50.0}).allowed
+    assert manager.can_open(**{**HEALTHY, "spread_points": 50.0,
+                               "spread_limit_points": 50.0}).allowed
+    assert not manager.can_open(**{**HEALTHY, "spread_points": 51.0,
+                                   "spread_limit_points": 50.0}).allowed
+
+
 def test_absolute_backstop_still_applies(manager: RiskManager, risk_cfg) -> None:
     """A nonsense quote is refused even if the measured limit would allow it."""
     decision = manager.can_open(**{**HEALTHY, "spread_points": 5000.0,

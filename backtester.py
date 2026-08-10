@@ -351,7 +351,10 @@ class Backtester:
         structure = self.engine.analyse(highs, lows, closes, times)
         # What counts as an abnormal spread is a property of this instrument,
         # measured from its own history rather than assumed.
-        spread_limit = float(np.percentile(spreads, self.risk_cfg.max_spread_percentile))
+        spread_limit = max(
+            float(np.percentile(spreads, self.risk_cfg.max_spread_percentile)),
+            float(np.median(spreads)) * self.risk_cfg.max_spread_median_multiple,
+        )
         log.info(
             "%s: %d bars, %d swings, %d breaks of structure, "
             "median spread %.0f, p%.0f cutoff %.0f points",

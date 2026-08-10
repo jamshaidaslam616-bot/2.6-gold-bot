@@ -52,6 +52,11 @@ MAX_CONSECUTIVE_ERRORS = 5
 class Daemon:
     def __init__(self) -> None:
         PATHS.ensure()
+        # Configure logging before anything else can want to log. Without this
+        # the root logger has no handlers and every log line in the daemon is
+        # silently discarded — the bot runs fine and leaves no record of what
+        # it did, which is the worst of both worlds when a trade goes wrong.
+        logging_setup.setup(PATHS.logs, filename="bot.log")
         self.secrets = load_secrets()
         self.engine = TwoSixEngine(STRATEGY)
         self.journal = Journal(PATHS.journal_csv)
@@ -208,7 +213,10 @@ class Daemon:
         )
         if bars.empty:
             return RISK.max_spread_points
-        return float(bars["spread"].quantile(RISK.max_spread_percentile / 100.0))
+        return max(
+            float(bars["spread"].quantile(RISK.max_spread_percentile / 100.0)),
+            float(bars["spread"].median()) * RISK.max_spread_median_multiple,
+        )
 
     # -- pending order management ------------------------------------------
 
