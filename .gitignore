@@ -1,0 +1,22 @@
+# Credentials. Never commit.
+.env
+
+# Virtualenv
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Runtime artefacts
+logs/
+cache/
+runtime/
+reports/
+*.log
+*.csv
+*.parquet
+!.env.example

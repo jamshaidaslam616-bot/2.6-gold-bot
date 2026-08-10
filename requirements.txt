@@ -1,0 +1,9 @@
+# Runtime
+MetaTrader5>=5.0.45      # Windows-only; the terminal must be installed and running
+pandas>=2.0
+pyarrow>=14.0            # parquet cache for the historical bar store
+httpx>=0.27              # async Telegram client. NOT `requests` — main.py is an asyncio daemon
+python-dotenv>=1.0       # credentials come from .env, never from source
+
+# Development
+pytest>=8.0
