@@ -1,5 +1,11 @@
-# Credentials. Never commit.
-.env
+# Credentials.
+#
+# .env is deliberately NOT ignored — the owner asked for it to be committed on
+# 2026-08-10 so a new VPS can clone and run without retyping anything. It holds
+# throwaway demo credentials only.
+#
+# Before switching this project to a real account, put .env back on this list
+# and run `git rm --cached .env`. See the header inside .env itself.
 
 # Virtualenv
 .venv/
