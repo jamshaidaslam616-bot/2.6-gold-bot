@@ -46,6 +46,8 @@ log = logging_setup.get("main")
 
 LOOP_SECONDS = 15
 BARS_FOR_STRUCTURE = 400
+#: How often to log an "alive and idle" line when nothing is happening.
+HEARTBEAT_SECONDS = 300
 MAX_CONSECUTIVE_ERRORS = 5
 
 
@@ -71,6 +73,7 @@ class Daemon:
         self._pending: tuple[Timeframe, Setup, int] | None = None
         self._open_ticket: int | None = None
         self._errors = 0
+        self._last_heartbeat = datetime.min.replace(tzinfo=timezone.utc)
         self._stop = asyncio.Event()
         self._last_summary_day = ""
 
@@ -196,9 +199,30 @@ class Daemon:
         )
         if not decision.allowed:
             log.debug("no entry: %s", decision.reason)
+            await self._heartbeat(account.equity, decision.reason)
             return
 
         await self._look_for_setup(account.equity)
+        await self._heartbeat(account.equity, "scanning")
+
+    async def _heartbeat(self, equity: float, note: str) -> None:
+        """Say something at a fixed interval even when nothing is happening.
+
+        A daemon that only logs when it acts is indistinguishable from a dead
+        one. The first live run sat silent for 37 minutes and then died; the
+        silence looked exactly like healthy standing-aside. This makes 'alive
+        and idle' and 'stopped' different in the log file, which is where
+        anyone will look first.
+        """
+        now = datetime.now(timezone.utc)
+        if (now - self._last_heartbeat).total_seconds() < HEARTBEAT_SECONDS:
+            return
+        self._last_heartbeat = now
+        log.info(
+            "heartbeat | equity %.2f | today %+.2f in %d trades | pending %s | %s",
+            equity, self.risk.state.realised_today, self.risk.state.trades_today,
+            self._pending[2] if self._pending else "none", note,
+        )
 
     async def _spread_limit(self) -> float:
         """What counts as an abnormally wide spread on *this* instrument.
