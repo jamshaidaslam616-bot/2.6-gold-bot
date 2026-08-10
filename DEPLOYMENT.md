@@ -4,35 +4,91 @@ Naye Windows VPS par is bot ko chalane ka poora tareeqa.
 
 ---
 
-## 0. Pehle ek baat saaf — "terminal band ho to bhi chale"
+## 0. "Band karne" ke do alag matlab — dono ka jawab
 
-**Yeh mumkin nahi hai, aur main aap ko sach bata raha hoon ta ke aap ghalat
-tawaqqo par plan na banayein.**
+### 0a. PowerShell window band ho jaye — **haan, bot chalta rahega**
 
-`MetaTrader5` Python package broker se seedha baat **nahi** karta. Woh aap ke
-computer par chalte hue `terminal64.exe` se baat karta hai (IPC ke zariye).
-Terminal band = koi raasta nahi. Yeh library ki bunyadi shakl hai, koi setting
-nahi jo isay badal de.
+Yeh aasan hai. Do tareeqe:
 
-Exness (ya koi bhi retail MT5 broker) aam customers ko REST API nahi deta, to
-terminal ko bypass karne ka koi tareeqa nahi.
+```powershell
+# Tareeqa 1 — window band karne par bhi chalta rahe (foran)
+Start-Process powershell -WindowStyle Hidden -ArgumentList `
+  "-ExecutionPolicy Bypass -File C:\gold-2.6-bot\run.ps1"
 
-### Lekin jo aap waqai chahte hain, woh **mumkin hai**
+# Tareeqa 2 — scheduled task (behtar; reboot ke baad bhi chalu ho jata hai)
+Start-ScheduledTask -TaskName Gold26Bot        # section 5 mein banaya hua
+```
 
-Aap ka asal maqsad shayad yeh hai: *"main RDP band kar doon, laptop band kar
-doon, aur bot chalta rahe."* **Woh bilkul hota hai** —
+Dono soorton mein PowerShell ki window band kar dein, RDP se nikal jayein,
+laptop band kar dein — **bot chalta rahega.** Chalta hai ya nahi, yeh dekhne
+ke liye:
+
+```powershell
+Get-Process python | Where-Object { $_.Path -like "*gold-2.6-bot*" }
+Get-Content C:\gold-2.6-bot\logs\bot.log -Tail 20
+```
+
+Rokne ke liye:
+
+```powershell
+Stop-ScheduledTask -TaskName Gold26Bot
+# ya
+Get-Process python | Where-Object { $_.Path -like "*gold-2.6-bot*" } | Stop-Process
+```
+
+### 0b. MT5 terminal band ho jaye — **yeh mumkin nahi**
+
+Yeh alag cheez hai aur iska jawab imaandari se "nahi" hai.
+
+`MetaTrader5` Python package broker se seedha baat **nahi** karta. Woh chalte
+hue `terminal64.exe` se IPC ke zariye baat karta hai. Terminal band = koi
+raasta nahi. Yeh library ki bunyadi shakl hai, koi setting nahi jo isay badle.
+Exness retail customers ko REST API bhi nahi deta.
+
+**Lekin isay sambhalna nahi parta:**
+
+- Bot khud `initialize(path=...)` se terminal **launch kar deta hai** agar woh
+  band ho
+- Terminal crash ho jaye to agle cycle par bot use dobara utha leta hai
+- Use dekhne ke liye kisi ka baithna zaroori **nahi**
+
+### 0c. Baqi sab kuch mar jaye to?
 
 | Aap ki fikr | Haqeeqat |
 |---|---|
-| "Main RDP se nikal jaonga" | VPS ka session chalta rehta hai. Terminal aur bot dono chalte rehte hain. **Sirf "Disconnect" karein, "Sign out" nahi** — sign out session maar deta hai |
-| "Mera laptop band ho jayega" | Koi farq nahi. Sab kuch VPS par chal raha hai |
-| "Terminal crash ho gaya to?" | Bot khud `initialize(path=...)` se **dobara launch kar deta hai** |
-| "Bot crash ho gaya to?" | `run.ps1` use se dobara start kar deta hai (backoff ke sath) |
-| "VPS reboot ho gaya to?" | Auto-logon + scheduled task — section 5 |
-| "Sab kuch mar gaya aur position khuli thi?" | **Har order ke sath SL aur TP broker par lage hue hain.** Bot, terminal, VPS teeno mar jayein tab bhi position broker khud band karega. Yeh sab se ahem safety hai aur pehle se bani hui hai |
+| PowerShell window band | Bot chalta rahega — section 0a |
+| RDP se nikal gaya | VPS session chalta rehta hai. **"Disconnect" karein, "Sign out" nahi** — sign out session maar deta hai aur uske sath sab kuch |
+| Laptop band | Koi farq nahi, sab VPS par hai |
+| MT5 terminal crash | Bot khud dobara launch kar deta hai |
+| Bot crash | `run.ps1` backoff ke sath restart karta hai |
+| VPS reboot | Auto-logon + scheduled task — section 5 |
+| **Sab kuch mar gaya aur position khuli thi** | **Har order ke sath SL aur TP broker par lage hue hain.** Bot, terminal, VPS teeno mar jayein tab bhi position broker khud band karega |
 
-To amli tor par bot 24/5 chalta rahega. Bas terminal ka process zinda rehna
-chahiye — **use dekhne ke liye kisi ka baithna zaroori nahi.**
+Aakhri row sab se ahem hai. Bot ka zinda rehna *achha* hai, lekin aap ka paisa
+uspar munhasir **nahi** — brackets broker ke server par hain, aap ke VPS par nahi.
+
+---
+
+## 0d. Naye VPS par — sab se chhota raasta
+
+```powershell
+# 1. Python 3.12 install karein ("Add Python to PATH" tick karein)
+# 2. MT5 install karein C:\MT5-Gold26 mein, ek baar login karein
+# 3. phir:
+cd C:\
+git clone https://github.com/jamshaidaslam616-bot/2.6-gold-bot.git gold-2.6-bot
+cd C:\gold-2.6-bot
+python -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+copy .env.example .env
+notepad .env                                        # credentials bharein
+.venv\Scripts\python.exe -m pytest tests\ -q        # 61 pass hone chahiyen
+.venv\Scripts\python.exe backtester.py --months 12  # koi order nahi jata
+Start-Process powershell -WindowStyle Hidden -ArgumentList "-ExecutionPolicy Bypass -File C:\gold-2.6-bot\run.ps1"
+```
+
+`.env` repo mein **nahi** hai — woh har VPS par alag se banana hoga. Yehi maqsad
+hai: credentials kabhi git mein nahi jate.
 
 ---
 
