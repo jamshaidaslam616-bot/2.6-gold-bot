@@ -28,6 +28,7 @@ from datetime import datetime, timedelta, timezone
 import logger as logging_setup
 from config import (
     COSTS,
+    MANAGEMENT,
     PATHS,
     RISK,
     STRATEGY,
@@ -72,6 +73,7 @@ class Daemon:
 
         self._pending: tuple[Timeframe, Setup, int] | None = None
         self._open_ticket: int | None = None
+        self._open_setup: tuple[Timeframe, Setup] | None = None
         self._errors = 0
         self._last_heartbeat = datetime.min.replace(tzinfo=timezone.utc)
         self._stop = asyncio.Event()
@@ -174,10 +176,24 @@ class Daemon:
         if self._open_ticket and not any(p.ticket == self._open_ticket for p in positions):
             await self._record_close(self._open_ticket, account.equity)
             self._open_ticket = None
+            self._open_setup = None
 
-        # 3. a bracketed position needs nothing from us
+        # 2b. did a resting order fill? The journal is written HERE, not when
+        #     the order was placed — an order that expires unfilled is not a
+        #     trade, and journalling it at placement left a phantom row that
+        #     never closed.
+        if self._pending is not None:
+            timeframe, setup, ticket = self._pending
+            filled = next((p for p in positions if p.ticket == ticket), None)
+            if filled is not None:
+                await self._record_fill(timeframe, setup, filled, account.equity)
+                self._pending = None
+
+        # 3. a bracketed position needs nothing from us, except the one thing
+        #    the broker cannot do: close it when it has been open too long.
         if positions:
             self._open_ticket = positions[0].ticket
+            await self._close_if_stale(positions[0], account.equity)
             return
 
         # 4. resolve any resting order
@@ -204,6 +220,83 @@ class Daemon:
 
         await self._look_for_setup(account.equity)
         await self._heartbeat(account.equity, "scanning")
+
+    async def _close_if_stale(self, position, equity: float) -> None:
+        """Close a position that has outlived its holding limit.
+
+        A pending order expires at the broker; an open position does not, and
+        the first live one sat for 63 hours blocking every other setup. The
+        broker has no mechanism for this, so the daemon has to do it — which
+        also means a dead daemon leaves the position open on its brackets
+        rather than closing it, and that is the right way round.
+        """
+        limit = MANAGEMENT.max_hold_bars
+        if not limit:
+            return
+        timeframe = self._open_setup[0] if self._open_setup else Timeframe.M15
+        age_minutes = (datetime.now(timezone.utc) - position.opened_at).total_seconds() / 60
+        if age_minutes < limit * timeframe.minutes:
+            return
+
+        log.info(
+            "position %s has been open %.1fh, past the %d-bar (%.0fh) limit — closing",
+            position.ticket, age_minutes / 60, limit, limit * timeframe.minutes / 60,
+        )
+        result = await asyncio.to_thread(self.executor.close, position.ticket)
+        if not result.ok:
+            log.warning("could not close %s: %s", position.ticket, result.describe())
+            await self.notifier.system_error(f"stale close failed: {result.describe()}")
+            return
+        await self.notifier.send(
+            f"⏱ <b>TIME EXIT</b>\n<code>ticket {position.ticket}\n"
+            f"open {age_minutes / 60:.1f}h, limit {limit * timeframe.minutes / 60:.0f}h\n"
+            f"floating was {position.floating_pnl:+.2f}</code>"
+        )
+
+    async def _record_fill(self, timeframe: Timeframe, setup: Setup, position,
+                           equity: float) -> None:
+        """Journal and announce a fill, using the price actually obtained."""
+        assert self.spec and self.session
+        self._open_ticket = position.ticket
+        self._open_setup = (timeframe, setup)
+
+        mppu = self.spec.money_per_price_unit_per_lot
+        risk_usd = abs(position.entry - setup.stop_loss) * position.lots * mppu
+        reward_usd = abs(setup.take_profit - position.entry) * position.lots * mppu
+        breakeven = risk_usd / (risk_usd + reward_usd) * 100 if (risk_usd + reward_usd) else 0.0
+        spread = await asyncio.to_thread(self.session.live_spread_points, self.spec.name)
+
+        self.journal.record_open(
+            JournalRow(
+                opened_utc=position.opened_at.isoformat(timespec="seconds"),
+                timeframe=timeframe.value,
+                magic=timeframe.magic,
+                account=self.session.account().login,
+                symbol=self.spec.name,
+                direction=setup.direction.value,
+                ticket=position.ticket,
+                lots=position.lots,
+                entry=round(position.entry, self.spec.digits),
+                stop_loss=round(setup.stop_loss, self.spec.digits),
+                take_profit=round(setup.take_profit, self.spec.digits),
+                risk_usd=round(risk_usd, 2),
+                reward_usd=round(reward_usd, 2),
+                breakeven_winrate_pct=round(breakeven, 1),
+                leg=round(setup.impulse.range, self.spec.digits),
+                swing_high=round(setup.impulse.swing_high, self.spec.digits),
+                swing_low=round(setup.impulse.swing_low, self.spec.digits),
+                spread_points_at_entry=round(spread, 1),
+                equity_at_entry=round(equity, 2),
+            )
+        )
+        log.info("FILLED %s at %.3f (%s)", position.ticket, position.entry, setup.describe())
+        await self.notifier.trade_opened(
+            direction=setup.direction.value, lots=position.lots, symbol=self.spec.name,
+            timeframe=timeframe.value, entry=position.entry, stop_loss=setup.stop_loss,
+            take_profit=setup.take_profit, risk_usd=risk_usd, reward_usd=reward_usd,
+            leg=setup.impulse.range, ticket=position.ticket,
+            breakeven_winrate_pct=breakeven,
+        )
 
     async def _heartbeat(self, equity: float, note: str) -> None:
         """Say something at a fixed interval even when nothing is happening.
@@ -337,40 +430,20 @@ class Daemon:
             await self.notifier.system_error(f"order not placed: {result.describe()}")
             return
 
+        # Nothing is journalled or announced here. A resting order is not a
+        # trade — the first one placed live expired six hours later without
+        # ever filling, and journalling at placement left a row that could
+        # never be closed. The journal is written when the fill is observed.
         self._pending = (timeframe, setup, result.ticket or 0)
-        reward_usd = setup.reward_distance * sizing.lots * self.spec.money_per_price_unit_per_lot
-        breakeven = sizing.risk_usd / (sizing.risk_usd + reward_usd) * 100
-
-        spread = await asyncio.to_thread(self.session.live_spread_points, self.spec.name)
-        self.journal.record_open(
-            JournalRow(
-                opened_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                timeframe=timeframe.value,
-                magic=timeframe.magic,
-                account=self.session.account().login,
-                symbol=self.spec.name,
-                direction=setup.direction.value,
-                ticket=result.ticket or 0,
-                lots=sizing.lots,
-                entry=round(setup.entry, self.spec.digits),
-                stop_loss=round(setup.stop_loss, self.spec.digits),
-                take_profit=round(setup.take_profit, self.spec.digits),
-                risk_usd=round(sizing.risk_usd, 2),
-                reward_usd=round(reward_usd, 2),
-                breakeven_winrate_pct=round(breakeven, 1),
-                leg=round(setup.impulse.range, self.spec.digits),
-                swing_high=round(setup.impulse.swing_high, self.spec.digits),
-                swing_low=round(setup.impulse.swing_low, self.spec.digits),
-                spread_points_at_entry=round(spread, 1),
-                equity_at_entry=round(equity, 2),
-            )
-        )
-        await self.notifier.trade_opened(
-            direction=setup.direction.value, lots=sizing.lots, symbol=self.spec.name,
-            timeframe=timeframe.value, entry=setup.entry, stop_loss=setup.stop_loss,
-            take_profit=setup.take_profit, risk_usd=sizing.risk_usd,
-            reward_usd=reward_usd, leg=setup.impulse.range, ticket=result.ticket,
-            breakeven_winrate_pct=breakeven,
+        log.info("order %s resting at %.3f, expires %s",
+                 result.ticket, setup.entry, f"{expiry:%H:%M}")
+        await self.notifier.send(
+            f"📌 <b>ORDER PLACED</b>  {setup.direction.value.upper()} "
+            f"{sizing.lots} {self.spec.name}\n"
+            f"<code>waiting at {setup.entry:.3f}\n"
+            f"stop  {setup.stop_loss:.3f}\ntarget {setup.take_profit:.3f}\n"
+            f"expires {expiry:%H:%M} UTC</code>\n"
+            f"<i>not filled yet — this is a resting order</i>"
         )
 
     # -- exit ---------------------------------------------------------------

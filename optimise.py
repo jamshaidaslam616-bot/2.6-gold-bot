@@ -151,6 +151,11 @@ def main() -> None:
     parser.add_argument("--management", action="store_true",
                         help="sweep position management (breakeven, trailing, "
                              "partials, max holding time) instead of the target")
+    parser.add_argument("--hold", type=int, default=0,
+                        help="apply this max holding time to every candidate. The "
+                             "target and the holding limit interact — a trade that "
+                             "gets closed on time may prefer a nearer target — so "
+                             "they are worth testing together, not only apart")
     args = parser.parse_args()
 
     if args.management:
@@ -159,6 +164,12 @@ def main() -> None:
         candidates = [c for c in CANDIDATES if c.is_spec]
     else:
         candidates = CANDIDATES
+
+    if args.hold:
+        candidates = [
+            replace(c, management=replace(c.management, max_hold_bars=args.hold))
+            for c in candidates
+        ]
 
     PATHS.ensure()
     logging_setup.setup(PATHS.logs, filename="optimise.log")

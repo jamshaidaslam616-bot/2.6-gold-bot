@@ -333,8 +333,33 @@ class Paths:
 STRATEGY = StrategyConfig()
 RISK = RiskConfig()
 COSTS = CostConfig()
-#: Off by default — the unmodified specification is what runs.
-MANAGEMENT = ManagementConfig()
+
+#: Decided 2026-08-13 after sweeping twelve management variants and ten targets
+#: over four years with an out-of-sample split.
+#:
+#: Only the holding limit is on. Reasons, in order of how much they mattered:
+#:
+#:   * it is the one setting whose in-sample lead survived out-of-sample, and
+#:     three of the four variants that were positive in BOTH periods involved it
+#:   * it frees the single position slot. The first live trade sat open for 63
+#:     hours and blocked 14 of the 16 setups that appeared in that window; the
+#:     owner wants one position at a time, which makes the slot precious
+#:   * it caps the give-back structurally
+#:
+#: Left off deliberately:
+#:   * breakeven stops — actively harmful. At 0.5R the out-of-sample mean R was
+#:     -0.037 and the win rate collapsed from 34% to 16%
+#:   * trailing — lifts the win rate to 50-64% without lifting expectancy. It
+#:     makes the curve feel better and earns nothing for it
+#:   * partials — at 0.5% risk the sizes are 0.01-0.02 lots, so half a position
+#:     is below the broker minimum and cannot be closed at all
+#:
+#: 48 bars on M15 is twelve hours. And note what the target sweep said once the
+#: holding limit was in place: nearer targets got *worse* (a 0.6R target scored
+#: t = -2.25 in-sample, the most significant result in the whole study, and it
+#: was negative). The spec's 1:2 sits in the consistently-positive cluster, so
+#: it stays exactly as specified.
+MANAGEMENT = ManagementConfig(max_hold_bars=48)
 PATHS = Paths()
 
 BACKTEST_MONTHS = 12
