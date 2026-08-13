@@ -47,6 +47,7 @@ class Candidate:
     rr: float = 2.0
     extension: float = 0.0
     management: ManagementConfig = MANAGEMENT
+    max_positions: int = RISK.max_concurrent_positions
 
     @property
     def is_spec(self) -> bool:
@@ -86,6 +87,19 @@ MANAGEMENT_CANDIDATES = [
     Candidate("trail 1R + hold 96",
               management=ManagementConfig(trail_from_r=1.0, trail_distance_r=1.0,
                                           max_hold_bars=96)),
+]
+
+
+#: How many positions may be open at once. The owner chose one and said so
+#: explicitly, then asked whether more would actually be better. Note what more
+#: positions really means: each is sized at 0.5% of equity, so three concurrent
+#: trades put 1.5% at risk simultaneously — the daily loss limit is 3%, so two
+#: bad days of three-up trading reaches it.
+CONCURRENCY_CANDIDATES = [
+    Candidate("1 position (chosen)", max_positions=1),
+    Candidate("2 positions", max_positions=2),
+    Candidate("3 positions", max_positions=3),
+    Candidate("5 positions", max_positions=5),
 ]
 
 
@@ -148,6 +162,8 @@ def main() -> None:
                         help="test only the owner's 1:2 spec — use this when the "
                              "question is which TIMEFRAME has an edge, so the "
                              "answer is not contaminated by also fitting the target")
+    parser.add_argument("--concurrency", action="store_true",
+                        help="sweep how many positions may be open at once")
     parser.add_argument("--management", action="store_true",
                         help="sweep position management (breakeven, trailing, "
                              "partials, max holding time) instead of the target")
@@ -158,7 +174,9 @@ def main() -> None:
                              "they are worth testing together, not only apart")
     args = parser.parse_args()
 
-    if args.management:
+    if args.concurrency:
+        candidates = CONCURRENCY_CANDIDATES
+    elif args.management:
         candidates = MANAGEMENT_CANDIDATES
     elif args.spec_only:
         candidates = [c for c in CANDIDATES if c.is_spec]
@@ -206,6 +224,7 @@ def main() -> None:
             # Halts off: a 10% drawdown mid-period would truncate the sample and
             # make candidates incomparable. The winner is re-run with halts on.
             bt = Backtester(spec, strategy_cfg=engine_cfg, costs=costs,
+                            risk_cfg=replace(RISK, max_concurrent_positions=candidate.max_positions),
                             management=candidate.management, enforce_halts=False)
             result = bt.run(
                 bars, timeframe, starting_equity=10_000.0,

@@ -447,7 +447,11 @@ class Backtester:
             risk.state.day = times[0].date().isoformat()
 
             pending: Setup | None = None
-            open_trade: _OpenTrade | None = None
+            # A list, so `max_concurrent_positions` can be tested rather than
+            # assumed. One order rests at a time either way — that is how the
+            # live daemon works — so concurrency builds up one fill at a time.
+            open_trades: list[_OpenTrade] = []
+            room = self.risk_cfg.max_concurrent_positions
 
             for t in range(len(bars)):
                 bar_high, bar_low = float(highs[t]), float(lows[t])
@@ -456,31 +460,31 @@ class Backtester:
                 if self.enforce_halts and risk.state.roll_day(now.date().isoformat(), equity):
                     pass  # counters reset; drawdown ceiling deliberately does not
 
-                # 1. an open position is managed before anything new is considered
-                if open_trade is not None:
+                # 1. open positions are managed before anything new is considered
+                if open_trades:
                     steps = intrabar.steps(
                         pd.Timestamp(ts[t]), pd.Timestamp(ts[t]) + bar_span
                     ) if intrabar else None
-                    hit = self._manage_and_exit(
-                        open_trade, bar_high, bar_low, float(closes[t]), t, steps
-                    )
-                    if hit is not None:
+                    survivors: list[_OpenTrade] = []
+                    for held in open_trades:
+                        hit = self._manage_and_exit(
+                            held, bar_high, bar_low, float(closes[t]), t, steps
+                        )
+                        if hit is None:
+                            survivors.append(held)
+                            continue
                         reason, price = hit
                         trade, equity = self._close(
-                            open_trade, price, reason, now, equity, timeframe.value
+                            held, price, reason, now, equity, timeframe.value
                         )
                         result.trades.append(trade)
                         risk.record_closed_trade(trade.net_usd)
                         risk.observe_equity(equity, now)   # bar time, not wall clock
-                        open_trade = None
-                        if self.enforce_halts and (
-                            risk.kill_switch_engaged() or risk.state.halted_reason
-                        ):
-                            if risk.kill_switch_engaged() and result.halted_at is None:
-                                result.halted_at = now
-                                result.halt_reason = risk.state.halted_reason
-                    if open_trade is not None:
-                        continue
+                        if self.enforce_halts and risk.kill_switch_engaged() \
+                                and result.halted_at is None:
+                            result.halted_at = now
+                            result.halt_reason = risk.state.halted_reason
+                    open_trades = survivors
 
                 # 2. a pending setup is resolved on this bar
                 if pending is not None:
@@ -491,10 +495,11 @@ class Backtester:
                     )
                     if state is SetupState.FILLED:
                         opened = self._try_open(
-                            pending, t, now, spreads, spread_limit, equity, risk, result
+                            pending, t, now, spreads, spread_limit, equity, risk, result,
+                            open_positions=len(open_trades),
                         )
                         if opened is not None:
-                            open_trade = opened
+                            open_trades.append(opened)
                             result.setups_filled += 1
                         pending = None
                         continue
@@ -510,7 +515,7 @@ class Backtester:
 
                 # 3. only now, at the close of bar t, may a new setup be formed.
                 #    It can therefore not act before bar t+1.
-                if pending is None and open_trade is None:
+                if pending is None and len(open_trades) < room:
                     setup = self.engine.signal_at(
                         structure,
                         as_of_index=t,
@@ -521,10 +526,10 @@ class Backtester:
                         pending = setup
                         result.setups_created += 1
 
-            # any position still open when the data runs out is marked to market
-            if open_trade is not None:
+            # anything still open when the data runs out is marked to market
+            for held in open_trades:
                 trade, equity = self._close(
-                    open_trade, float(closes[-1]), "end_of_data", times[-1],
+                    held, float(closes[-1]), "end_of_data", times[-1],
                     equity, timeframe.value,
                 )
                 result.trades.append(trade)
@@ -543,6 +548,7 @@ class Backtester:
         equity: float,
         risk: RiskManager,
         result: BacktestResult,
+        open_positions: int = 0,
     ) -> _OpenTrade | None:
         spread_price = self._spread_price(spreads, index)
         spread_points = spread_price / self.spec.point
@@ -550,7 +556,7 @@ class Backtester:
         if self.enforce_halts:
             decision = risk.can_open(
                 is_demo=True,
-                open_positions=0,
+                open_positions=open_positions,
                 spread_points=spread_points,
                 clock_drift_seconds=0.0,
                 equity=equity,
