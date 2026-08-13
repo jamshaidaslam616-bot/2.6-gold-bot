@@ -298,6 +298,16 @@ class Daemon:
         if self._pending is not None:
             if await self._resolve_pending(positions):
                 return
+        elif self._pending_raw is not None:
+            # Adopted from a previous run. There is no Setup object to
+            # re-evaluate, so supersede/invalidate cannot be checked — the
+            # broker-side expiry handles it instead. What matters here is that
+            # we do NOT fall through and try to place another order: the
+            # idempotency check would refuse it, but only after the daemon had
+            # rebuilt the whole signal and asked the broker, every 15 seconds,
+            # for as long as the order rested.
+            await self._heartbeat(account.equity, "adopted order resting")
+            return
 
         # 5. look for a new setup
         decision = self.risk.can_open(
