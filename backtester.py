@@ -36,6 +36,7 @@ would really have hit is reporting a system nobody is running.
 from __future__ import annotations
 
 import argparse
+import math
 import csv
 import tempfile
 from collections.abc import Sequence
@@ -54,8 +55,10 @@ from config import (
     LIVE_TIMEFRAMES,
     PATHS,
     RISK,
+    MANAGEMENT,
     STRATEGY,
     CostConfig,
+    ManagementConfig,
     RiskConfig,
     StrategyConfig,
     Timeframe,
@@ -260,7 +263,17 @@ class _OpenTrade:
     lots: float
     entry_price: float
     opened_at: datetime
+    opened_index: int
     spread_price_at_entry: float
+    stop: float                  # moves when management is on; else the setup's
+    best_price: float            # most favourable price seen, for trailing
+    remaining_lots: float
+    realised_partial: float = 0.0
+    partial_taken: bool = False
+
+    @property
+    def risk(self) -> float:
+        return abs(self.entry_price - self.setup.stop_loss)
 
 
 class Backtester:
@@ -270,6 +283,7 @@ class Backtester:
         strategy_cfg: StrategyConfig = STRATEGY,
         risk_cfg: RiskConfig = RISK,
         costs: CostConfig = COSTS,
+        management: ManagementConfig = MANAGEMENT,
         *,
         enforce_halts: bool = True,
     ) -> None:
@@ -277,6 +291,7 @@ class Backtester:
         self.engine = TwoSixEngine(strategy_cfg)
         self.risk_cfg = risk_cfg
         self.costs = costs
+        self.management = management
         self.enforce_halts = enforce_halts
 
     def _spread_price(self, spreads: np.ndarray, index: int) -> float:
@@ -291,33 +306,92 @@ class Backtester:
 
     # -- exit detection -----------------------------------------------------
 
-    def _exit_on_bar(
+    def _take_partial(self, trade: _OpenTrade, level: float) -> None:
+        """Close part of the position at `level`, if the broker would allow it.
+
+        At $10,000 with 0.5% risk the sizes are 0.01-0.02 lots, and half of
+        0.01 is below the 0.01 minimum — so on this account a partial is
+        usually not executable at all. Rather than pretend otherwise, the
+        partial is simply skipped when the remainder would be untradeable.
+        """
+        step, minimum = self.spec.volume_step, self.spec.volume_min
+        want = trade.remaining_lots * self.management.partial_fraction
+        lots = math.floor(want / step + 1e-9) * step
+        if lots < minimum or trade.remaining_lots - lots < minimum:
+            trade.partial_taken = True      # decided, and the answer was "cannot"
+            return
+        sign = 1.0 if trade.setup.direction is Direction.BULLISH else -1.0
+        gross = (level - trade.entry_price) * sign * lots * self.spec.money_per_price_unit_per_lot
+        trade.realised_partial += gross - 2 * self.costs.commission_per_lot_per_side * lots
+        trade.remaining_lots = round(trade.remaining_lots - lots, 8)
+        trade.partial_taken = True
+
+    def _manage_and_exit(
         self,
         trade: _OpenTrade,
         bar_high: float,
         bar_low: float,
+        bar_close: float,
+        bar_index: int,
         steps: list[tuple[float, float]] | None,
     ) -> tuple[str, float] | None:
-        """('sl'|'tp', price) if this bar closed the trade.
+        """Walk the bar, apply position management, and report any exit.
 
         With `steps` the sub-bars are walked in order and the first level
         touched wins — the honest answer. Without them the stop is checked
         first, which is the answer that cannot flatter us.
+
+        The stop is always tested against its value at the *start* of the step,
+        before that step's own high is allowed to tighten it. Otherwise a bar
+        that ran up and back down could trail the stop using its own high and
+        then be stopped out by its own low — the simulator inventing an exit
+        that no real stop order could have produced.
         """
-        setup = trade.setup
+        cfg = self.management
+        bullish = trade.setup.direction is Direction.BULLISH
+        risk = trade.risk
         sequence = steps if steps else [(bar_high, bar_low)]
+
         for high, low in sequence:
-            if setup.direction is Direction.BULLISH:
-                if low <= setup.stop_loss:
-                    return "sl", setup.stop_loss
-                if high >= setup.take_profit:
-                    return "tp", setup.take_profit
-            else:
-                if high >= setup.stop_loss:
-                    return "sl", setup.stop_loss
-                if low <= setup.take_profit:
-                    return "tp", setup.take_profit
+            stop_at_step_start = trade.stop
+            if bullish and low <= stop_at_step_start:
+                return self._stop_reason(trade, stop_at_step_start), stop_at_step_start
+            if not bullish and high >= stop_at_step_start:
+                return self._stop_reason(trade, stop_at_step_start), stop_at_step_start
+
+            favourable = (high - trade.entry_price) if bullish else (trade.entry_price - low)
+            r_now = favourable / risk if risk else 0.0
+
+            if cfg.partial_at_r and not trade.partial_taken and r_now >= cfg.partial_at_r:
+                level = trade.entry_price + cfg.partial_at_r * risk * (1 if bullish else -1)
+                self._take_partial(trade, level)
+
+            if cfg.breakeven_at_r and r_now >= cfg.breakeven_at_r:
+                trade.stop = (max(trade.stop, trade.entry_price) if bullish
+                              else min(trade.stop, trade.entry_price))
+
+            if cfg.trails and r_now >= cfg.trail_from_r:
+                trade.best_price = max(trade.best_price, high) if bullish else min(trade.best_price, low)
+                offset = cfg.trail_distance_r * risk
+                trailed = trade.best_price - offset if bullish else trade.best_price + offset
+                trade.stop = max(trade.stop, trailed) if bullish else min(trade.stop, trailed)
+
+            if bullish and high >= trade.setup.take_profit:
+                return "tp", trade.setup.take_profit
+            if not bullish and low <= trade.setup.take_profit:
+                return "tp", trade.setup.take_profit
+
+        if cfg.max_hold_bars and (bar_index - trade.opened_index) >= cfg.max_hold_bars:
+            return "time", bar_close
         return None
+
+    @staticmethod
+    def _stop_reason(trade: _OpenTrade, stop: float) -> str:
+        """Distinguish the original structural stop from a moved one, so the
+        report can say whether management helped or merely got in the way."""
+        if abs(stop - trade.setup.stop_loss) < 1e-9:
+            return "sl"
+        return "breakeven" if abs(stop - trade.entry_price) < 1e-9 else "trail"
 
     # -- the replay ---------------------------------------------------------
 
@@ -387,7 +461,9 @@ class Backtester:
                     steps = intrabar.steps(
                         pd.Timestamp(ts[t]), pd.Timestamp(ts[t]) + bar_span
                     ) if intrabar else None
-                    hit = self._exit_on_bar(open_trade, bar_high, bar_low, steps)
+                    hit = self._manage_and_exit(
+                        open_trade, bar_high, bar_low, float(closes[t]), t, steps
+                    )
                     if hit is not None:
                         reason, price = hit
                         trade, equity = self._close(
@@ -500,7 +576,11 @@ class Backtester:
             lots=sizing.lots,
             entry_price=setup.entry,
             opened_at=when,
+            opened_index=index,
             spread_price_at_entry=spread_price,
+            stop=setup.stop_loss,
+            best_price=setup.entry,
+            remaining_lots=sizing.lots,
         )
 
     def _close(
@@ -516,7 +596,11 @@ class Backtester:
         mppu = self.spec.money_per_price_unit_per_lot
         sign = 1.0 if setup.direction is Direction.BULLISH else -1.0
 
-        gross = (exit_price - trade.entry_price) * sign * trade.lots * mppu
+        # Only the lots still open are closed here; anything taken as a partial
+        # was already realised at its own price and is carried in
+        # `realised_partial`.
+        closing_lots = trade.remaining_lots
+        gross = (exit_price - trade.entry_price) * sign * closing_lots * mppu
         # The spread is NOT subtracted here — it is already embedded in `gross`.
         # The fill trigger required the bid to travel a further `spread` before
         # the order could execute, and the entry is recorded at the ask we paid.
@@ -524,9 +608,12 @@ class Backtester:
         # so the report can show what the spread actually cost.
         spread_usd = trade.spread_price_at_entry * trade.lots * mppu
         slippage_usd = 2 * self.costs.slippage_points * self.spec.point * trade.lots * mppu
-        commission_usd = 2 * self.costs.commission_per_lot_per_side * trade.lots
-        net = gross - slippage_usd - commission_usd
+        commission_usd = 2 * self.costs.commission_per_lot_per_side * closing_lots
+        net = gross + trade.realised_partial - slippage_usd - commission_usd
 
+        # R is measured against the risk originally taken on the full position,
+        # so a partial that reduces exposure shows up as a smaller R rather than
+        # being flattered by a shrinking denominator.
         risk_usd = setup.risk_distance * trade.lots * mppu
         equity_after = equity + net
         return (

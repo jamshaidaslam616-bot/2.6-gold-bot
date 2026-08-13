@@ -33,7 +33,8 @@ import pandas as pd
 
 import logger as logging_setup
 from backtester import Backtester, IntrabarResolver, load_market
-from config import (COSTS, LIVE_TIMEFRAMES, PATHS, RISK, STRATEGY, CostConfig,
+from config import (COSTS, LIVE_TIMEFRAMES, MANAGEMENT, PATHS, RISK, STRATEGY,
+                    CostConfig, ManagementConfig,
                     TakeProfitMode, Timeframe)
 
 log = logging_setup.get("optimise")
@@ -42,13 +43,15 @@ log = logging_setup.get("optimise")
 @dataclass(frozen=True, slots=True)
 class Candidate:
     label: str
-    mode: TakeProfitMode
+    mode: TakeProfitMode = TakeProfitMode.RISK_MULTIPLE
     rr: float = 2.0
     extension: float = 0.0
+    management: ManagementConfig = MANAGEMENT
 
     @property
     def is_spec(self) -> bool:
-        return self.mode is TakeProfitMode.RISK_MULTIPLE and self.rr == 2.0
+        return (self.mode is TakeProfitMode.RISK_MULTIPLE and self.rr == 2.0
+                and self.management.is_untouched_spec)
 
     def apply(self):
         return replace(
@@ -57,6 +60,33 @@ class Candidate:
             min_risk_reward=self.rr,
             peak_extension=self.extension,
         )
+
+
+#: Position management. The spec has none — a trade is opened and left alone —
+#: so every one of these is a deviation. They are here because the first live
+#: position reached +1.75R, twelve dollars short of its target, and then gave
+#: back $106 to finish underwater. That is one trade; whether any of this helps
+#: is what the out-of-sample column is for.
+MANAGEMENT_CANDIDATES = [
+    Candidate("spec (nothing)"),
+    Candidate("breakeven @0.5R", management=ManagementConfig(breakeven_at_r=0.5)),
+    Candidate("breakeven @1R", management=ManagementConfig(breakeven_at_r=1.0)),
+    Candidate("trail 1R from 1R",
+              management=ManagementConfig(trail_from_r=1.0, trail_distance_r=1.0)),
+    Candidate("trail 0.5R from 1R",
+              management=ManagementConfig(trail_from_r=1.0, trail_distance_r=0.5)),
+    Candidate("trail 0.5R from 0.5R",
+              management=ManagementConfig(trail_from_r=0.5, trail_distance_r=0.5)),
+    Candidate("partial 50% @1R", management=ManagementConfig(partial_at_r=1.0)),
+    Candidate("max hold 24 bars", management=ManagementConfig(max_hold_bars=24)),
+    Candidate("max hold 48 bars", management=ManagementConfig(max_hold_bars=48)),
+    Candidate("max hold 96 bars", management=ManagementConfig(max_hold_bars=96)),
+    Candidate("BE @1R + hold 96",
+              management=ManagementConfig(breakeven_at_r=1.0, max_hold_bars=96)),
+    Candidate("trail 1R + hold 96",
+              management=ManagementConfig(trail_from_r=1.0, trail_distance_r=1.0,
+                                          max_hold_bars=96)),
+]
 
 
 CANDIDATES = [
@@ -118,9 +148,17 @@ def main() -> None:
                         help="test only the owner's 1:2 spec — use this when the "
                              "question is which TIMEFRAME has an edge, so the "
                              "answer is not contaminated by also fitting the target")
+    parser.add_argument("--management", action="store_true",
+                        help="sweep position management (breakeven, trailing, "
+                             "partials, max holding time) instead of the target")
     args = parser.parse_args()
 
-    candidates = ([c for c in CANDIDATES if c.is_spec] if args.spec_only else CANDIDATES)
+    if args.management:
+        candidates = MANAGEMENT_CANDIDATES
+    elif args.spec_only:
+        candidates = [c for c in CANDIDATES if c.is_spec]
+    else:
+        candidates = CANDIDATES
 
     PATHS.ensure()
     logging_setup.setup(PATHS.logs, filename="optimise.log")
@@ -147,7 +185,7 @@ def main() -> None:
         print(f"  IN-SAMPLE      {bars['timestamp'].iloc[0]:%Y-%m-%d} -> {boundary:%Y-%m-%d}")
         print(f"  OUT-OF-SAMPLE  {boundary:%Y-%m-%d} -> {bars['timestamp'].iloc[-1]:%Y-%m-%d}")
         print("=" * 96)
-        print(f"{'take profit':<16}{'IS n':>6}{'IS meanR':>10}{'IS t':>7}{'IS PF':>7}"
+        print(f"{'variant':<21}{'IS n':>6}{'IS meanR':>10}{'IS t':>7}{'IS PF':>7}"
               f"   |{'OOS n':>7}{'OOS meanR':>11}{'OOS t':>8}{'OOS PF':>8}{'OOS win%':>10}")
         print("-" * 96)
 
@@ -157,13 +195,13 @@ def main() -> None:
             # Halts off: a 10% drawdown mid-period would truncate the sample and
             # make candidates incomparable. The winner is re-run with halts on.
             bt = Backtester(spec, strategy_cfg=engine_cfg, costs=costs,
-                            enforce_halts=False)
+                            management=candidate.management, enforce_halts=False)
             result = bt.run(
                 bars, timeframe, starting_equity=10_000.0,
                 intrabar=intrabar if timeframe.minutes > Timeframe.M5.minutes else None,
             )
             if not result.trades:
-                print(f"{candidate.label:<16}  no trades")
+                print(f"{candidate.label:<21}  no trades")
                 continue
 
             trades = pd.DataFrame([
@@ -176,7 +214,7 @@ def main() -> None:
             rows.append((candidate, is_, oos))
 
             mark = "  <- SPEC" if candidate.is_spec else ""
-            print(f"{candidate.label:<16}{is_.n:>6}{is_.mean_r:>+10.3f}{is_.t_stat:>7.2f}"
+            print(f"{candidate.label:<21}{is_.n:>6}{is_.mean_r:>+10.3f}{is_.t_stat:>7.2f}"
                   f"{is_.profit_factor:>7.2f}   |{oos.n:>7}{oos.mean_r:>+11.3f}"
                   f"{oos.t_stat:>8.2f}{oos.profit_factor:>8.2f}{oos.win_rate:>9.1f}%{mark}")
 

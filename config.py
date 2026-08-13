@@ -239,6 +239,50 @@ class RiskConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class ManagementConfig:
+    """What happens to a position after it is opened.
+
+    The specification says nothing about this: entry at the 2.6 level, stop on
+    the Origin, target at 1:2, and then the trade is left alone. Every field
+    here is therefore a **deviation from the spec**, and defaults to off so the
+    unmodified strategy is what runs unless someone deliberately changes it.
+
+    They exist because the first live position ran to +1.75R — twelve dollars
+    short of its target — and then gave back $106 to finish underwater. With no
+    management there is no mechanism that could have kept any of it.
+
+    Whether any of these actually help is a question for the backtest with an
+    out-of-sample split, not for the two trades that prompted them.
+    """
+
+    #: Move the stop to entry once the trade is this many R in front. 0 = off.
+    breakeven_at_r: float = 0.0
+
+    #: Start trailing once this many R in front, keeping the stop this far
+    #: behind the best price seen. Both must be non-zero for trailing to apply.
+    trail_from_r: float = 0.0
+    trail_distance_r: float = 0.0
+
+    #: Close this fraction of the position at this many R. 0 = off.
+    partial_at_r: float = 0.0
+    partial_fraction: float = 0.5
+
+    #: Close at market after this many bars of the signal timeframe. 0 = off.
+    #: A pending order already expires; an open position currently does not,
+    #: and the first one sat for 63 hours blocking 14 other setups.
+    max_hold_bars: int = 0
+
+    @property
+    def trails(self) -> bool:
+        return self.trail_from_r > 0 and self.trail_distance_r > 0
+
+    @property
+    def is_untouched_spec(self) -> bool:
+        return not (self.breakeven_at_r or self.trails
+                    or self.partial_at_r or self.max_hold_bars)
+
+
+@dataclass(frozen=True, slots=True)
 class CostConfig:
     """Measured, not assumed.
 
@@ -289,6 +333,8 @@ class Paths:
 STRATEGY = StrategyConfig()
 RISK = RiskConfig()
 COSTS = CostConfig()
+#: Off by default — the unmodified specification is what runs.
+MANAGEMENT = ManagementConfig()
 PATHS = Paths()
 
 BACKTEST_MONTHS = 12
