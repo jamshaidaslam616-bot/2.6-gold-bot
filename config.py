@@ -61,6 +61,16 @@ class Timeframe(str, Enum):
         # 2600 + minutes, so a magic number says which timeframe opened it.
         return 2600000 + self.minutes
 
+    @classmethod
+    def from_magic(cls, magic: int) -> Timeframe | None:
+        """Recover the timeframe from a position's magic number.
+
+        The broker always reports magic, so this works after a restart when the
+        daemon has no memory of why a position exists. Guessing the timeframe
+        instead would silently apply the wrong holding limit.
+        """
+        return next((tf for tf in cls if tf.magic == magic), None)
+
     @property
     def mt5_constant_name(self) -> str:
         """Resolved by name against the MetaTrader5 module rather than

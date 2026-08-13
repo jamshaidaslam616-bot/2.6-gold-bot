@@ -21,9 +21,13 @@ structure survives noise that shakes out a five-minute swing.
 from __future__ import annotations
 
 import asyncio
+import json
 import signal
 import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import pandas as pd
 
 import logger as logging_setup
 from config import (
@@ -74,6 +78,7 @@ class Daemon:
         self._pending: tuple[Timeframe, Setup, int] | None = None
         self._open_ticket: int | None = None
         self._open_setup: tuple[Timeframe, Setup] | None = None
+        self._pending_raw: dict | None = None
         self._errors = 0
         self._last_heartbeat = datetime.min.replace(tzinfo=timezone.utc)
         self._stop = asyncio.Event()
@@ -117,6 +122,86 @@ class Daemon:
             f"symbol   {self.spec.name}\nequity   {account.equity:,.2f}\n"
             f"risk     {RISK.risk_per_trade_pct}%/trade, 1 position max</code>"
         )
+        await self._adopt_broker_state()
+
+    async def _adopt_broker_state(self) -> None:
+        """Take ownership of whatever we left behind last time.
+
+        Without this a restart loses the thread: an order resting at the broker
+        is invisible to the daemon, so when it fills nothing journals it, and
+        when it later closes `record_close` finds no open row and drops the
+        trade from the record entirely. The position is still bracketed and
+        still safe — but it goes unrecorded, and an unrecorded trade cannot be
+        counted, which defeats the whole point of running this on demo.
+
+        `runtime/pending.json` carries the structure fields the broker does not
+        know (the impulse range and its swings) so an adopted fill is journalled
+        as completely as a fresh one.
+        """
+        assert self.executor
+        positions = await asyncio.to_thread(self.executor.open_positions)
+        orders = await asyncio.to_thread(self.executor.pending_orders)
+        saved = self._load_pending()
+
+        if positions:
+            position = positions[0]
+            self._open_ticket = position.ticket
+            timeframe = Timeframe.from_magic(position.magic)
+            log.info("adopted open position %s (%s, opened %s)",
+                     position.ticket, timeframe.value if timeframe else "?",
+                     f"{position.opened_at:%Y-%m-%d %H:%M}")
+            if not self._journal_has(position.ticket):
+                # It filled while we were down. Journal it from what the broker
+                # knows; the structure columns stay blank rather than invented.
+                await self._record_fill_from_broker(position, saved)
+
+        if orders:
+            order = orders[0]
+            if saved and saved.get("ticket") == order.ticket:
+                log.info("adopted resting order %s from saved state", order.ticket)
+                self._pending_raw = saved
+            else:
+                log.warning(
+                    "order %s is resting at the broker but we have no record of "
+                    "its setup — cancelling rather than managing it blind",
+                    order.ticket,
+                )
+                await asyncio.to_thread(self.executor.cancel, order.ticket)
+                self._clear_pending()
+        elif saved:
+            self._clear_pending()   # the order is gone; the note is stale
+
+    def _journal_has(self, ticket: int) -> bool:
+        return any(r.get("ticket") == str(ticket) for r in self.journal.read())
+
+    def _pending_path(self) -> Path:
+        return PATHS.runtime / "pending.json"
+
+    def _save_pending(self, timeframe: Timeframe, setup: Setup, ticket: int) -> None:
+        self._pending_path().write_text(json.dumps({
+            "timeframe": timeframe.value,
+            "ticket": ticket,
+            "direction": setup.direction.value,
+            "entry": setup.entry,
+            "stop_loss": setup.stop_loss,
+            "take_profit": setup.take_profit,
+            "leg": setup.impulse.range,
+            "swing_high": setup.impulse.swing_high,
+            "swing_low": setup.impulse.swing_low,
+        }, indent=2), encoding="utf-8")
+
+    def _load_pending(self) -> dict | None:
+        path = self._pending_path()
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 - a corrupt note is not worth dying for
+            log.warning("pending.json is unreadable — ignoring it")
+            return None
+
+    def _clear_pending(self) -> None:
+        self._pending_path().unlink(missing_ok=True)
 
     async def stop(self) -> None:
         if self.executor is not None:
@@ -188,6 +273,19 @@ class Daemon:
             if filled is not None:
                 await self._record_fill(timeframe, setup, filled, account.equity)
                 self._pending = None
+        elif self._pending_raw is not None:
+            # An order adopted from a previous run: we know its ticket and its
+            # structure from disk, but not the Setup object.
+            ticket = int(self._pending_raw["ticket"])
+            filled = next((p for p in positions if p.ticket == ticket), None)
+            if filled is not None:
+                await self._record_fill_from_broker(filled, self._pending_raw)
+                self._pending_raw = None
+            elif not any(o.ticket == ticket for o in
+                         await asyncio.to_thread(self.executor.pending_orders)):
+                log.info("adopted order %s is gone without filling", ticket)
+                self._pending_raw = None
+                self._clear_pending()
 
         # 3. a bracketed position needs nothing from us, except the one thing
         #    the broker cannot do: close it when it has been open too long.
@@ -233,14 +331,27 @@ class Daemon:
         limit = MANAGEMENT.max_hold_bars
         if not limit:
             return
-        timeframe = self._open_setup[0] if self._open_setup else Timeframe.M15
-        age_minutes = (datetime.now(timezone.utc) - position.opened_at).total_seconds() / 60
-        if age_minutes < limit * timeframe.minutes:
+        # From the magic, not from memory: after a restart there is no memory,
+        # and defaulting to a timeframe would apply the wrong limit silently.
+        timeframe = Timeframe.from_magic(position.magic) or Timeframe.M15
+
+        # Counted in CLOSED BARS, not wall-clock minutes, because that is what
+        # the backtest counts. Over a weekend the clock runs and the market does
+        # not; using minutes would force-close Friday-evening positions into a
+        # shut market and make live behaviour diverge from the simulation.
+        bars = await asyncio.to_thread(
+            self.session.recent_bars, self.spec.name, timeframe, limit + 8
+        )
+        if bars.empty:
+            return
+        elapsed = int((bars["timestamp"] > pd.Timestamp(position.opened_at)).sum())
+        if elapsed < limit:
             return
 
+        age_hours = (datetime.now(timezone.utc) - position.opened_at).total_seconds() / 3600
         log.info(
-            "position %s has been open %.1fh, past the %d-bar (%.0fh) limit — closing",
-            position.ticket, age_minutes / 60, limit, limit * timeframe.minutes / 60,
+            "position %s has been open %d bars (%.1fh), past the %d-bar limit — closing",
+            position.ticket, elapsed, age_hours, limit,
         )
         result = await asyncio.to_thread(self.executor.close, position.ticket)
         if not result.ok:
@@ -249,20 +360,21 @@ class Daemon:
             return
         await self.notifier.send(
             f"⏱ <b>TIME EXIT</b>\n<code>ticket {position.ticket}\n"
-            f"open {age_minutes / 60:.1f}h, limit {limit * timeframe.minutes / 60:.0f}h\n"
+            f"open {elapsed} bars ({age_hours:.1f}h), limit {limit}\n"
             f"floating was {position.floating_pnl:+.2f}</code>"
         )
 
-    async def _record_fill(self, timeframe: Timeframe, setup: Setup, position,
-                           equity: float) -> None:
-        """Journal and announce a fill, using the price actually obtained."""
+    async def _journal_fill(self, timeframe: Timeframe, position, equity: float,
+                            leg: float, swing_high: float, swing_low: float) -> None:
+        """The one place a fill is written. Stop and target are read back from
+        the broker rather than from our own request, so the journal records what
+        is actually protecting the position."""
         assert self.spec and self.session
         self._open_ticket = position.ticket
-        self._open_setup = (timeframe, setup)
 
         mppu = self.spec.money_per_price_unit_per_lot
-        risk_usd = abs(position.entry - setup.stop_loss) * position.lots * mppu
-        reward_usd = abs(setup.take_profit - position.entry) * position.lots * mppu
+        risk_usd = abs(position.entry - position.stop_loss) * position.lots * mppu
+        reward_usd = abs(position.take_profit - position.entry) * position.lots * mppu
         breakeven = risk_usd / (risk_usd + reward_usd) * 100 if (risk_usd + reward_usd) else 0.0
         spread = await asyncio.to_thread(self.session.live_spread_points, self.spec.name)
 
@@ -270,33 +382,61 @@ class Daemon:
             JournalRow(
                 opened_utc=position.opened_at.isoformat(timespec="seconds"),
                 timeframe=timeframe.value,
-                magic=timeframe.magic,
+                magic=position.magic,
                 account=self.session.account().login,
                 symbol=self.spec.name,
-                direction=setup.direction.value,
+                direction=position.direction.value,
                 ticket=position.ticket,
                 lots=position.lots,
                 entry=round(position.entry, self.spec.digits),
-                stop_loss=round(setup.stop_loss, self.spec.digits),
-                take_profit=round(setup.take_profit, self.spec.digits),
+                stop_loss=round(position.stop_loss, self.spec.digits),
+                take_profit=round(position.take_profit, self.spec.digits),
                 risk_usd=round(risk_usd, 2),
                 reward_usd=round(reward_usd, 2),
                 breakeven_winrate_pct=round(breakeven, 1),
-                leg=round(setup.impulse.range, self.spec.digits),
-                swing_high=round(setup.impulse.swing_high, self.spec.digits),
-                swing_low=round(setup.impulse.swing_low, self.spec.digits),
+                leg=round(leg, self.spec.digits),
+                swing_high=round(swing_high, self.spec.digits),
+                swing_low=round(swing_low, self.spec.digits),
                 spread_points_at_entry=round(spread, 1),
                 equity_at_entry=round(equity, 2),
             )
         )
-        log.info("FILLED %s at %.3f (%s)", position.ticket, position.entry, setup.describe())
+        log.info("FILLED %s %s %.2f lots at %.3f  sl %.3f  tp %.3f",
+                 position.ticket, position.direction.value, position.lots,
+                 position.entry, position.stop_loss, position.take_profit)
         await self.notifier.trade_opened(
-            direction=setup.direction.value, lots=position.lots, symbol=self.spec.name,
-            timeframe=timeframe.value, entry=position.entry, stop_loss=setup.stop_loss,
-            take_profit=setup.take_profit, risk_usd=risk_usd, reward_usd=reward_usd,
-            leg=setup.impulse.range, ticket=position.ticket,
-            breakeven_winrate_pct=breakeven,
+            direction=position.direction.value, lots=position.lots, symbol=self.spec.name,
+            timeframe=timeframe.value, entry=position.entry, stop_loss=position.stop_loss,
+            take_profit=position.take_profit, risk_usd=risk_usd, reward_usd=reward_usd,
+            leg=leg, ticket=position.ticket, breakeven_winrate_pct=breakeven,
         )
+
+    async def _record_fill(self, timeframe: Timeframe, setup: Setup, position,
+                           equity: float) -> None:
+        self._open_setup = (timeframe, setup)
+        await self._journal_fill(timeframe, position, equity, setup.impulse.range,
+                                 setup.impulse.swing_high, setup.impulse.swing_low)
+        self._clear_pending()
+
+    async def _record_fill_from_broker(self, position, saved: dict | None) -> None:
+        """Journal a fill we were not running to see.
+
+        The broker knows the price, size, stop and target. It does not know the
+        impulse that produced them, so those columns come from the saved note
+        if there is one and are left at zero if not — blank is honest, invented
+        numbers are not.
+        """
+        assert self.session
+        timeframe = Timeframe.from_magic(position.magic) or Timeframe.M15
+        equity = self.session.account().equity
+        if saved and saved.get("ticket") == position.ticket:
+            await self._journal_fill(timeframe, position, equity, float(saved["leg"]),
+                                     float(saved["swing_high"]), float(saved["swing_low"]))
+        else:
+            log.warning("journalling %s without its structure — no saved setup",
+                        position.ticket)
+            await self._journal_fill(timeframe, position, equity, 0.0, 0.0, 0.0)
+        self._clear_pending()
 
     async def _heartbeat(self, equity: float, note: str) -> None:
         """Say something at a fixed interval even when nothing is happening.
@@ -435,6 +575,7 @@ class Daemon:
         # ever filling, and journalling at placement left a row that could
         # never be closed. The journal is written when the fill is observed.
         self._pending = (timeframe, setup, result.ticket or 0)
+        self._save_pending(timeframe, setup, result.ticket or 0)
         log.info("order %s resting at %.3f, expires %s",
                  result.ticket, setup.entry, f"{expiry:%H:%M}")
         await self.notifier.send(
