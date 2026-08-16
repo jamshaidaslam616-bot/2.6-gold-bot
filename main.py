@@ -40,7 +40,7 @@ from config import (
     Timeframe,
     load_secrets,
 )
-from data import BrokerError, Mt5Session, SymbolSpec
+from data import MAX_TICK_AGE_SECONDS, BrokerError, Mt5Session, SymbolSpec
 from engine import Direction, Setup, SetupState, TwoSixEngine
 from execution import Executor, OrderRequest
 from journal import Journal, JournalRow
@@ -309,7 +309,20 @@ class Daemon:
             await self._heartbeat(account.equity, "adopted order resting")
             return
 
-        # 5. look for a new setup
+        # 5. look for a new setup.
+        #    A shut market first: the quote stops updating at the weekend, and
+        #    both the server-time offset and everything derived from it become
+        #    unmeasurable. Re-measuring here means the offset is picked up as
+        #    soon as the market reopens rather than staying wrong all week.
+        await asyncio.to_thread(self.session.refresh_server_offset)
+        tick_age = await asyncio.to_thread(self.session.tick_age_seconds)
+        if tick_age > MAX_TICK_AGE_SECONDS:
+            await self._heartbeat(
+                account.equity,
+                f"market shut — last quote {tick_age / 3600:.1f}h old",
+            )
+            return
+
         decision = self.risk.can_open(
             is_demo=account.is_demo,
             open_positions=len(positions),

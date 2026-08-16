@@ -42,6 +42,10 @@ log = logging_setup.get("data")
 #: an empty window; a None result carrying anything else is a real failure.
 MT5_SUCCESS_CODE = 1
 
+#: A quote older than this is a shut market, not latency. Used both to reject a
+#: bogus server-time measurement and to refuse to trade on stale prices.
+MAX_TICK_AGE_SECONDS = 300.0
+
 #: Symbols whose trade mode is 0 cannot be traded. Exness carries lookalikes
 #: (XAUUSD247) with trading disabled; selecting one fails only at order time.
 TRADE_MODE_DISABLED = 0
@@ -140,6 +144,7 @@ class Mt5Session:
         self._server = server
         self._connected = False
         self._server_offset = timedelta(0)
+        self._offset_measured = False
         self._time_symbol: str | None = None
 
     @property
@@ -255,21 +260,72 @@ class Mt5Session:
 
     # -- time ---------------------------------------------------------------
 
-    def _measure_server_offset(self) -> timedelta:
-        """How far the server's clock labelling sits from UTC.
+    def tick_age_seconds(self) -> float:
+        """How old the last quote is. Large means the market is shut."""
+        if self._time_symbol is None:
+            return float("inf")
+        tick = self.mt5.symbol_info_tick(self._time_symbol)
+        if tick is None or not getattr(tick, "time", 0):
+            return float("inf")
+        seen = datetime.fromtimestamp(int(tick.time), tz=timezone.utc) - self._server_offset
+        return (datetime.now(timezone.utc) - seen).total_seconds()
+
+    def _measure_server_offset(self) -> timedelta | None:
+        """How far the server's clock labelling sits from UTC, or None.
 
         Rounded to the nearest hour: brokers sit on whole-hour offsets, and we
         do not want ordinary tick latency showing up as a fractional timezone.
+
+        **Only a fresh tick may be used.** Over a weekend the last quote is a
+        day and a half old, and measuring against it yields an "offset" of -33
+        hours — which is not a timezone, it is a stale tick. Observed on
+        2026-08-16: every bar timestamp was shifted 33 hours forward, so
+        Friday's closing bars were reported as Sunday's, and the clock-drift
+        guard blocked trading while blaming the wrong thing.
+
+        Returning None means "cannot tell right now" — the caller keeps
+        whatever it already had rather than adopting a wrong answer.
         """
         symbol = self._time_symbol
         if symbol is None:
-            return timedelta(0)
+            return None
         tick = self.mt5.symbol_info_tick(symbol)
         if tick is None or not getattr(tick, "time", 0):
-            return timedelta(0)
+            return None
         server = datetime.fromtimestamp(int(tick.time), tz=timezone.utc)
-        hours = round((server - datetime.now(timezone.utc)).total_seconds() / 3600.0)
+        gap = (server - datetime.now(timezone.utc)).total_seconds()
+        hours = round(gap / 3600.0)
+        # A real timezone offset is within +/- 14 hours, and what is left over
+        # after removing it is tick latency measured in seconds. Anything else
+        # is a stale quote wearing a timezone's clothes.
+        if abs(hours) > 14 or abs(gap - hours * 3600) > MAX_TICK_AGE_SECONDS:
+            log.warning(
+                "ignoring server-time measurement: last tick is %.1f hours from "
+                "our clock, which is a shut market rather than a timezone",
+                gap / 3600,
+            )
+            return None
         return timedelta(hours=hours)
+
+    def refresh_server_offset(self) -> bool:
+        """Adopt a server-time offset only when one can honestly be measured.
+
+        Called at symbol resolution and again on each loop, so an offset that
+        could not be taken over the weekend gets picked up as soon as the
+        market reopens. Returns whether we now have a measured value.
+        """
+        measured = self._measure_server_offset()
+        if measured is not None:
+            if measured != self._server_offset or not self._offset_measured:
+                log.info("server clock offset measured: %+.0fh",
+                         measured.total_seconds() / 3600)
+            self._server_offset = measured
+            self._offset_measured = True
+        return self._offset_measured
+
+    @property
+    def offset_is_measured(self) -> bool:
+        return self._offset_measured
 
     @property
     def server_offset(self) -> timedelta:
@@ -277,16 +333,22 @@ class Mt5Session:
 
     def clock_drift_seconds(self) -> float:
         """Signed difference between the server's clock and ours once the
-        timezone offset is removed. A skewed clock corrupts bar-age checks
-        invisibly, so the risk layer refuses to trade past a threshold."""
+        timezone offset is removed.
+
+        Reported as zero while the market is shut. A stale quote is not clock
+        drift, and conflating them made the guard fire every weekend blaming a
+        skew that did not exist. Staleness is a separate condition with its own
+        check — see `tick_age_seconds`.
+        """
         self._require()
-        if self._time_symbol is None:
+        if self._time_symbol is None or not self._offset_measured:
             return 0.0
         tick = self.mt5.symbol_info_tick(self._time_symbol)
         if tick is None or not getattr(tick, "time", 0):
             raise self._fail(f"no tick for {self._time_symbol}")
         server = datetime.fromtimestamp(int(tick.time), tz=timezone.utc) - self._server_offset
-        return (server - datetime.now(timezone.utc)).total_seconds()
+        drift = (server - datetime.now(timezone.utc)).total_seconds()
+        return drift if abs(drift) <= MAX_TICK_AGE_SECONDS else 0.0
 
     def _to_utc(self, epoch_seconds: int) -> datetime:
         return datetime.fromtimestamp(int(epoch_seconds), tz=timezone.utc) - self._server_offset
@@ -346,9 +408,10 @@ class Mt5Session:
             raise self._fail(f"symbol_select({chosen}) failed")
 
         self._time_symbol = chosen
-        self._server_offset = self._measure_server_offset()
-        log.info("resolved symbol %s (server clock %+.0fh vs UTC)",
-                 chosen, self._server_offset.total_seconds() / 3600)
+        self.refresh_server_offset()
+        log.info("resolved symbol %s (server clock %+.0fh vs UTC%s)",
+                 chosen, self._server_offset.total_seconds() / 3600,
+                 "" if self._offset_measured else ", NOT YET MEASURED — market shut")
         return self.symbol_spec(chosen)
 
     def symbol_spec(self, symbol: str) -> SymbolSpec:
