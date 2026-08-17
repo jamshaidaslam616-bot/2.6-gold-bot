@@ -303,6 +303,23 @@ class Mt5Session:
 
     # -- time ---------------------------------------------------------------
 
+    def algo_trading_allowed(self) -> bool:
+        """Whether the terminal will accept an order at all.
+
+        This is the "Algo Trading" toggle in the MT5 window. It defaults to off
+        on a terminal that has just been started, and nothing in the API turns
+        it on — it is a decision the terminal's operator makes.
+
+        Worth checking *before* building an order rather than discovering it in
+        the rejection: on 2026-08-17 both trading terminals came up with it off
+        after a restart and every order was refused with retcode 10027. This bot
+        retried every fifteen seconds for nineteen hours — 1,485 rejections —
+        while its heartbeat cheerfully reported "scanning".
+        """
+        self._require()
+        info = self.mt5.terminal_info()
+        return bool(info is not None and getattr(info, "trade_allowed", False))
+
     def tick_age_seconds(self) -> float:
         """How old the last quote is. Large means the market is shut."""
         if self._time_symbol is None:

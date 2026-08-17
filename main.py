@@ -79,6 +79,7 @@ class Daemon:
         self._open_ticket: int | None = None
         self._open_setup: tuple[Timeframe, Setup] | None = None
         self._pending_raw: dict | None = None
+        self._blocked_reason = ""
         self._errors = 0
         self._last_heartbeat = datetime.min.replace(tzinfo=timezone.utc)
         self._stop = asyncio.Event()
@@ -345,6 +346,18 @@ class Daemon:
             )
             return
 
+        # The terminal's own Algo Trading toggle. Checked here so a switched-off
+        # terminal is reported once, loudly, instead of being rediscovered in
+        # every rejected order for the next nineteen hours.
+        if not await asyncio.to_thread(self.session.algo_trading_allowed):
+            await self._report_blocked(
+                "Algo Trading is OFF in the terminal — no order can be placed. "
+                "Turn it on in MT5 (the 'Algo Trading' button) or set "
+                "[Experts] AllowLiveTrading=1 in config/common.ini and restart it."
+            )
+            return
+        self._blocked_reason = ""
+
         decision = self.risk.can_open(
             is_demo=account.is_demo,
             open_positions=len(positions),
@@ -482,6 +495,19 @@ class Daemon:
                         position.ticket)
             await self._journal_fill(timeframe, position, equity, 0.0, 0.0, 0.0)
         self._clear_pending()
+
+    async def _report_blocked(self, reason: str) -> None:
+        """Say once, in the log and on Telegram, that the bot cannot act.
+
+        Once — not every cycle. A condition that stops all trading deserves to
+        interrupt someone; the same line 1,485 times deserves to be ignored,
+        and will be.
+        """
+        if self._blocked_reason == reason:
+            return
+        self._blocked_reason = reason
+        log.error("BLOCKED: %s", reason)
+        await self.notifier.send(f"🚫 <b>BLOCKED</b>\n<code>{reason}</code>")
 
     async def _heartbeat(self, equity: float, note: str) -> None:
         """Say something at a fixed interval even when nothing is happening.
