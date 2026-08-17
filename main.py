@@ -240,6 +240,28 @@ class Daemon:
     async def _handle_error(self, what: str) -> None:
         self._errors += 1
         log.error("cycle error %d/%d: %s", self._errors, MAX_CONSECUTIVE_ERRORS, what)
+
+        # Try to get the bridge back before spending another life. On
+        # 2026-08-17 the terminal exited, every read failed with "IPC send
+        # failed", and the daemon counted five errors into the kill switch
+        # without once attempting to reconnect — the one thing that would have
+        # fixed it, since reconnecting relaunches the terminal.
+        if self.session is not None and self._errors < MAX_CONSECUTIVE_ERRORS:
+            try:
+                account = await asyncio.to_thread(self.session.reconnect)
+                self.spec = await asyncio.to_thread(
+                    self.session.resolve_symbol, STRATEGY.symbol_search_patterns
+                )
+                log.info("reconnected to %s, equity %.2f", account.login, account.equity)
+                await self.notifier.send(
+                    f"🔌 <b>RECONNECTED</b>\n<code>{account.login}  "
+                    f"equity {account.equity:,.2f}</code>"
+                )
+                self._errors = 0
+                return
+            except Exception as exc:  # noqa: BLE001 - reconnect is best effort
+                log.warning("reconnect failed: %s", exc)
+
         await self.notifier.system_error(f"{what} ({self._errors}/{MAX_CONSECUTIVE_ERRORS})")
         if self._errors >= MAX_CONSECUTIVE_ERRORS:
             # Deliberately not an infinite retry. A bridge that keeps failing is

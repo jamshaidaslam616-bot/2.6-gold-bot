@@ -63,6 +63,22 @@ class SymbolResolutionError(RuntimeError):
     than guessed: trading the wrong instrument is worse than not starting."""
 
 
+class WrongAccountError(RuntimeError):
+    """The terminal is answering for an account we did not ask for.
+
+    This is not hypothetical. On 2026-08-17 this bot's own terminal exited and
+    the MetaTrader5 API silently attached to a different terminal that happened
+    to be running — one logged into another bot's account. The daemon read that
+    account's equity, 63,504 against our 9,962, for two hours: it recorded a new
+    peak equity six times too high, and any position it had opened would have
+    been sized against someone else's balance, on someone else's account.
+
+    `path=` is only a hint about which terminal to *launch*. It is not a
+    guarantee about which one you end up talking to, so identity has to be
+    checked on every read rather than assumed from the connection.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class SymbolSpec:
     """The contract, as the broker describes it. Every field is required.
@@ -194,8 +210,9 @@ class Mt5Session:
             raise self._fail("MT5 initialize() failed — is the terminal running?")
 
         self._connected = True
+        self._offset_measured = False   # a new terminal needs a fresh measurement
         try:
-            snapshot = self.account()
+            snapshot = self.account()   # also asserts we got the right account
         except Exception:
             self.disconnect()  # never leave a half-open connection behind
             raise
@@ -213,6 +230,20 @@ class Mt5Session:
             self.mt5.shutdown()
         finally:
             self._connected = False
+
+    def reconnect(self) -> AccountSnapshot:
+        """Full teardown and re-handshake.
+
+        Deliberately not a retry loop — the caller decides whether to try
+        again, because "retry until it works" is how the same order gets sent
+        twice. What this does fix is the case that killed the daemon on
+        2026-08-17: the terminal exited, every read failed with "IPC send
+        failed", and nothing ever tried to bring it back. Reconnecting relaunches
+        the terminal at `path` and re-checks which account answered.
+        """
+        log.warning("reconnecting to the terminal")
+        self.disconnect()
+        return self.connect()
 
     def is_connected(self) -> bool:
         """Ask the terminal, do not trust our own flag. A terminal that was
@@ -239,10 +270,22 @@ class Mt5Session:
     # -- account ------------------------------------------------------------
 
     def account(self) -> AccountSnapshot:
+        """Read the account, and refuse to hand back one we did not ask for.
+
+        The identity check is on every read, not just at connect. A terminal
+        can exit and be replaced by another under a live connection, and the
+        API will answer from whichever one it can reach — see WrongAccountError.
+        """
         self._require()
         info = self.mt5.account_info()
         if info is None:
             raise self._fail("account_info() returned None")
+        if self._login and int(info.login) != self._login:
+            raise WrongAccountError(
+                f"terminal is answering for account {int(info.login)} "
+                f"(equity {float(info.equity):,.2f}) but this bot trades "
+                f"{self._login}. Refusing to read or act on it."
+            )
         # trade_mode: 0 demo, 1 contest, 2 real. Anything not clearly demo is
         # reported as real — the safe error is over-caution.
         is_demo = int(getattr(info, "trade_mode", 2)) in (0, 1)

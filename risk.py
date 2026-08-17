@@ -224,6 +224,15 @@ class RiskManager:
         limit — a limit that never fires is worse than no limit, because it
         looks like one.
         """
+        # A non-positive equity is a failed read, not a wiped-out account. On
+        # 2026-08-17 one such read produced "drawdown 100.00%" and tripped the
+        # kill switch while the account was untouched at 9,962. Nothing that
+        # cannot be true is allowed to become a recorded fact.
+        if equity <= 0:
+            log.warning("ignoring an equity reading of %.2f — that is a failed "
+                        "read, not a balance", equity)
+            return
+
         moment = now or datetime.now(timezone.utc)
         today = moment.date().isoformat()
         if self.state.roll_day(today, equity):

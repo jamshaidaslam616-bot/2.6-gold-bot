@@ -104,3 +104,64 @@ def test_a_genuinely_skewed_clock_still_shows_as_drift() -> None:
     session._mt5 = FakeMt5(datetime.now(timezone.utc) + timedelta(seconds=90))  # noqa: SLF001
     drift = session.clock_drift_seconds()
     assert 60 < drift < 120
+
+
+# ---------------------------------------------------------------------------
+# Account identity
+# ---------------------------------------------------------------------------
+
+
+class FakeAccount:
+    def __init__(self, login: int, equity: float) -> None:
+        self.login = login
+        self.equity = equity
+        self.balance = equity
+        self.server = "Exness-MT5Trial16"
+        self.company = "Exness"
+        self.currency = "USD"
+        self.leverage = 2000
+        self.margin_free = equity
+        self.trade_mode = 0
+
+
+class FakeMt5WithAccount(FakeMt5):
+    def __init__(self, tick_at: datetime, login: int, equity: float) -> None:
+        super().__init__(tick_at)
+        self._account = FakeAccount(login, equity)
+
+    def account_info(self) -> FakeAccount:
+        return self._account
+
+
+def test_reading_another_bots_account_is_refused() -> None:
+    """The 2026-08-17 failure.
+
+    This bot's terminal exited and the API attached to a different one that was
+    running another bot's account. Equity read 63,504 instead of 9,962 for two
+    hours, which became a new recorded peak and would have sized any position
+    against someone else's balance.
+    """
+    from data import WrongAccountError
+
+    session = Mt5Session(login=472501540, password="x", server="s",
+                         mt5=FakeMt5WithAccount(datetime.now(timezone.utc),
+                                                login=472286354, equity=63504.27))
+    session._connected = True          # noqa: SLF001
+    with pytest.raises(WrongAccountError, match="472286354"):
+        session.account()
+
+
+def test_the_right_account_reads_normally() -> None:
+    session = Mt5Session(login=472501540, password="x", server="s",
+                         mt5=FakeMt5WithAccount(datetime.now(timezone.utc),
+                                                login=472501540, equity=9962.89))
+    session._connected = True          # noqa: SLF001
+    assert session.account().equity == pytest.approx(9962.89)
+
+
+def test_no_expected_login_means_no_check() -> None:
+    """Read-only tools attach without credentials and take what they find."""
+    session = Mt5Session(mt5=FakeMt5WithAccount(datetime.now(timezone.utc),
+                                                login=1, equity=5.0))
+    session._connected = True          # noqa: SLF001
+    assert session.account().login == 1
